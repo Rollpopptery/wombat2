@@ -1,0 +1,9 @@
+# Public repo — WHITELIST: track ONLY the schematic, PCB, and project file.
+# Everything else here stays OUT of version control: .history/, wombat2-backups/,
+# outputs/, custom libs (*.lib, Library.pretty/, fp-lib-table), and *.kicad_prl
+# (local UI state). Ignore all, then re-include the three deliverables.
+*
+!.gitignore
+!wombat2.kicad_sch
+!wombat2.kicad_pcb
+!wombat2.kicad_pro

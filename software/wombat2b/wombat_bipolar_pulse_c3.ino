@@ -11,6 +11,7 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <Preferences.h>
 #include "soc/soc.h"
 #include "soc/gpio_reg.h"
 #include "esp_cpu.h"
@@ -77,7 +78,7 @@
 // tick, so true coil ON time = PULSE_WIDTH_US - ~10 us. Constant every pulse,
 // so it doesn't matter - just don't be surprised on the scope.
 #define PULSE_WIDTH_US   (100)     // pulse ON window (start tick -> off tick)
-#define PULSE_PERIOD_US  (2000)    // full period.  2000 -> 2 ms -> 500 pulses/s (final rate). (was 250000 = 4 Hz slow-test)
+#define PULSE_PERIOD_US  (250000)  // 250 ms -> 4 Hz slow (bipolar bring-up; set 2000 = 500 Hz for final)
 
 // internal: convert to 25-us ISR ticks (what pulse_counter actually counts)
 #define V_PULSE_WIDTH   (PULSE_WIDTH_US  / 25)
@@ -136,6 +137,13 @@ volatile uint32_t g_damp_seg_cyc   = 48;  // width of each damping segment      
 // 0 = full bipolar engine with mirrored active damping (the intended design).
 #define SIMPLE_PULSE_NO_DAMP  1
 
+// Within the tuned-clamp engine (SIMPLE_PULSE_NO_DAMP=1):
+//   1 = BIPOLAR - alternate LEFT (HIGH_LEFT+LOW_RIGHT) and RIGHT (HIGH_RIGHT+LOW_LEFT)
+//       diagonals every pulse; the discharge sequence mirrors (LOW_RIGHT on LEFT
+//       pulses, LOW_LEFT on RIGHT), SAME g_hardoff_cyc / g_hold_ticks for both.
+//   0 = unipolar bench mode: always LEFT.
+#define BIPOLAR  1
+
 // ---- SAMPLING REGIME: 3 decay windows + 1 pre-pulse reference ---------------
 // All values in CPU cycles (~6.25 ns each @ 160 MHz). 1 us = 160 cycles.
 //
@@ -179,13 +187,22 @@ volatile uint32_t g_hardoff_cyc = US_TO_CYC(2);      // ~2 us dead-off before th
 // overhead makes the measured ON-time longer than US_TO_CYC() nominal
 // (US_TO_CYC(5)=800cyc measured ~8 us; 300cyc -> ~3 us). 600 cyc -> ~6 us measured.
 #define DUAL_LOW_CYC     (600)                        // both low-side ON at the trough, ~6 us measured, then both OFF
-// SIMPLE mode: LOW_RIGHT-only pulse after the dead-off (dumps the right-node
-// flyback cap). TWO live dials: '+'/'-' = dead-off timing (WHEN, g_hardoff_cyc),
-// '['/']' = LOW_RIGHT pulse width (HOW LONG, g_refire_cyc). Raw cycle count,
-// scope-calibrate: ~50 cyc measured ~1 us, so ~5 cyc -> ~0.1 us.
-// (Name kept g_refire_cyc from the dropped diagonal-re-fire experiment.)
-volatile uint32_t g_refire_cyc = 50;                  // ~1 us LOW_RIGHT pulse; live dial [ / ]
-#define REFIRE_MAX_CYC   (400)                         // cap ~4 us: hardoff(<=12us)+pulse+~31us sampling < 50us ISR budget
+// Pulse-end dials: '+'/'-' = dead-off timing (WHEN the low side turns on, fine,
+// g_hardoff_cyc). '['/']' = HOLD LENGTH (how long the low side stays on grounding
+// the coil end for measurement), in 25 us ticks - COARSE, tick-scheduled (not a
+// busy-wait), so it can be long (~100 us) without blowing the ISR budget.
+volatile uint32_t g_hold_ticks      = 4;   // low-side hold after hard-off (~100 us). live dial [ / ]
+#define HOLD_TICKS_MAX   (20)              // cap ~500 us; must end well before the next pulse
+volatile uint32_t g_lowside_off_tick = 0;  // ISR: pulse_counter value at which to drop the low side
+
+// --- Non-volatile save of the tuned hard-off (clamp START) time --------------
+// ESP32-C3 has no real EEPROM; Preferences uses the NVS flash partition, which
+// SURVIVES a normal sketch re-upload (separate partition). Serial 's' saves the
+// current g_hardoff_cyc; setup() restores it on boot. The hold length
+// (g_hold_ticks) is intentionally NOT saved - it stays at its compiled default.
+Preferences g_prefs;
+#define NVS_NAMESPACE    "wombat"
+#define NVS_KEY_HARDOFF  "hardoff"
 
 // ------------------------------------------------ ADS1115 (16-bit I2C ADC)
 // Reads the 4 held cap voltages. SLOW and that's fine: it runs from loop(),
@@ -253,6 +270,15 @@ void IRAM_ATTR timer_pulse_Interrupt()
 {
   pulse_counter++;
 
+  // ---- end the long low-side hold, ~g_hold_ticks*25us after the pulse-end tick.
+  // Tick-scheduled (not a busy-wait) so the hold can be ~100 us. One GPIO write.
+  if (g_lowside_off_tick && pulse_counter == g_lowside_off_tick)
+  {
+    LOW_LEFT_OFF;
+    LOW_RIGHT_OFF;
+    g_lowside_off_tick = 0;
+  }
+
   // ---------------------------------------------------------- END OF PULSE
   if (pulse_counter == V_PULSE_WIDTH)
   {
@@ -260,23 +286,19 @@ void IRAM_ATTR timer_pulse_Interrupt()
     D2_HIGH;                              // scope marker: pulse end
 
 #if SIMPLE_PULSE_NO_DAMP
-    // Simple unipolar pulse. Pulse-end sequence (LOW_RIGHT-only, 2026-08-04):
-    //   1. diagonal off (HIGH_LEFT + LOW_RIGHT) -> DEAD-OFF: bridge fully open
-    //   2. flyback rings for g_hardoff_cyc (~3 us, live-tunable + / -); tune so
-    //      the LOW_RIGHT pulse lands on the flyback voltage peak (coil current ~0).
-    //   3. LOW_RIGHT ON for g_refire_cyc (live dial [ / ]) to dump the right-node
-    //      flyback cap, then OFF -> bridge fully open, coil decays into sampling.
-    // The diagonal re-fire (HIGH_LEFT clamp) was tried 2026-08-04 and DROPPED: the
-    // ground SiC clamps across the low sides now pin the negative node swing in
-    // hardware, so there is no left-node ring for HIGH_LEFT to catch - LOW_RIGHT
-    // alone is enough. LOW_LEFT stays OFF (its series SiC + the 2k passive net).
-    LOW_LEFT_OFF;                         // start from all-low-off (LEFT stays off)
+    // Pulse-end sequence (bipolar, MIRRORED per direction):
+    //   1. DEAD-OFF: whole bridge open, flyback rings.
+    //   2. wait g_hardoff_cyc (fine, + / -, tuned+saved) - lands on the voltage peak.
+    //   3. low side ON, grounding the coil end for measurement. LEFT diagonal uses
+    //      LOW_RIGHT, RIGHT diagonal uses LOW_LEFT. Stays ON for ~g_hold_ticks*25us
+    //      (~100 us), dropped by the tick-scheduled check at the top of the ISR
+    //      (NOT a busy-wait, so it can be long). Sampling runs during the hold.
+    LOW_LEFT_OFF;
     LOW_RIGHT_OFF;
-    HIGH_LEFT_OFF;                        // dead-off: bridge fully open, flyback rings
+    HIGH_LEFT_OFF;  HIGH_RIGHT_OFF;      // dead-off: whole bridge open, flyback rings
     delay_cyc(g_hardoff_cyc);            // rings; tune to land on the voltage peak
-    LOW_RIGHT_ON;                        // RIGHT low-side only: dump the right-node flyback cap
-    delay_cyc(g_refire_cyc);            // LOW_RIGHT pulse width - live dial [ / ]
-    LOW_RIGHT_OFF;                       // OFF -> bridge fully open for the decay
+    if (phase_left) LOW_RIGHT_ON; else LOW_LEFT_ON;    // low side ON: ground the coil end
+    g_lowside_off_tick = pulse_counter + g_hold_ticks; // schedule the long hold's end
 #else
     if (phase_left)
     {
@@ -358,10 +380,10 @@ void IRAM_ATTR timer_pulse_Interrupt()
   {
     pulse_counter = 0;
 
-#if SIMPLE_PULSE_NO_DAMP
-    phase_left = true;                   // always LEFT: HIGH_LEFT + LOW_RIGHT
+#if SIMPLE_PULSE_NO_DAMP && !BIPOLAR
+    phase_left = true;                   // unipolar bench mode: always LEFT
 #else
-    phase_left = !phase_left;            // alternate direction every pulse
+    phase_left = !phase_left;            // alternate L/R diagonal every pulse
 #endif
 
     portENTER_CRITICAL_ISR(&pulseMux);   // ref window + pulse start must not jitter
@@ -421,6 +443,13 @@ void setup()
   Serial.begin(115200);
   g_cpu_mhz = getCpuFrequencyMhz();      // should report 160
 
+  // Restore the tuned hard-off (clamp start) time from NVS, if it was saved.
+  // Kept open (RW) so the 's' key can write back in loop(). Clamp on load.
+  g_prefs.begin(NVS_NAMESPACE, false);
+  uint32_t saved_hardoff = g_prefs.getUInt(NVS_KEY_HARDOFF, g_hardoff_cyc);
+  if (saved_hardoff <= HARDOFF_MAX_CYC) g_hardoff_cyc = saved_hardoff;
+  Serial.printf("hardoff restored = %u cyc\n", g_hardoff_cyc);
+
   // Drive OUTPUT LATCHES to the SAFE (all-off) state BEFORE enabling outputs,
   // so we never glitch a leg into shoot-through at startup.
   HIGH_LEFT_OFF;  HIGH_RIGHT_OFF;  LOW_LEFT_OFF;  LOW_RIGHT_OFF;  D2_LOW;
@@ -448,7 +477,7 @@ void setup()
   else
     Serial.println(F("pulse engine running. Scope D7 (debug) + coil."));
 
-  Serial.println(F("Tune damping:  '+' / '-' delay,  '[' / ']' segment width,  'r' read caps now"));
+  Serial.println(F("Tune:  '+'/'-' hard-off (clamp start),  '['/']' hold length (x25us),  's' save hard-off,  'r' read caps"));
 }
 
 // ====================================================================== loop
@@ -469,10 +498,12 @@ void loop()
     // Both are busy-waits inside the interrupt-masked pulse-end section, so both
     // MUST stay small: hardoff + pulse + ~31 us sampling has to fit the ~50 us
     // (two-tick) ISR budget or counts are lost and the cadence stalls. Both capped.
-    if      (c == '+') g_hardoff_cyc = (g_hardoff_cyc + 1 <= HARDOFF_MAX_CYC) ? g_hardoff_cyc + 1 : HARDOFF_MAX_CYC;
+    if      (c == '+' || c == '=') g_hardoff_cyc = (g_hardoff_cyc + 1 <= HARDOFF_MAX_CYC) ? g_hardoff_cyc + 1 : HARDOFF_MAX_CYC;
     else if (c == '-') g_hardoff_cyc = (g_hardoff_cyc >= 1) ? g_hardoff_cyc - 1 : 0;
-    else if (c == ']') g_refire_cyc  = (g_refire_cyc + 1 <= REFIRE_MAX_CYC) ? g_refire_cyc + 1 : REFIRE_MAX_CYC;
-    else if (c == '[') g_refire_cyc  = (g_refire_cyc >= 1) ? g_refire_cyc - 1 : 0;
+    else if (c == ']') g_hold_ticks = (g_hold_ticks + 1 <= HOLD_TICKS_MAX) ? g_hold_ticks + 1 : HOLD_TICKS_MAX;
+    else if (c == '[') g_hold_ticks = (g_hold_ticks >= 2) ? g_hold_ticks - 1 : 1;   // min 1 tick
+    else if (c == 's') { g_prefs.putUInt(NVS_KEY_HARDOFF, g_hardoff_cyc);   // save to NVS
+                         Serial.printf("saved hardoff = %u cyc\n", g_hardoff_cyc); continue; }
     else if (c == 'r') { force_read = true; continue; }
     else continue;
 #else
@@ -502,16 +533,14 @@ void loop()
     bool ok = ads1115_read_all();        // refresh g_cap_raw[] (used by detection math)
     doing_sampling = false;              // cap refresh resumes on the next pulse
 
-    // c1..c3 = decay windows, ref = pre-pulse baseline (cap4). d1..d3 = decay-ref.
-    // 1 LSB = 125 uV. Assumes cap1..4 -> AIN0..AIN3 (confirm if values look swapped).
+    // Serial Plotter format: "label:value" pairs, tab-separated, numbers only.
+    // c1..c3 = raw decay-window ADC codes; ref = raw pre-pulse baseline (cap4).
+    // d1..d3 = decay AMPLITUDE = ref - decay (positive: the decay swings BELOW the
+    // baseline through the inverting amp). Raw ADS LSB, 125 uV each. cap1..4 -> AIN0..AIN3.
     if (ok)
-      Serial.printf("c1=%6d c2=%6d c3=%6d ref=%6d | d1=%6d d2=%6d d3=%6d\n",
-                    g_cap_raw[0], g_cap_raw[1], g_cap_raw[2], g_cap_raw[3],
-                    g_cap_raw[0] - g_cap_raw[3],
-                    g_cap_raw[1] - g_cap_raw[3],
-                    g_cap_raw[2] - g_cap_raw[3]);
-    else
-      Serial.println(F("ADS read failed"));
+      Serial.printf("c1_c3:%d\tc2_c3:%d\n",
+                    g_cap_raw[0] - g_cap_raw[2],
+                    g_cap_raw[1] - g_cap_raw[2]);
   }
 
   if (sampleReady) sampleReady = false;  // (kept for future per-pulse work)

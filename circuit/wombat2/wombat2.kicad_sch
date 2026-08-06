@@ -12229,9 +12229,8 @@
 				(justify left)
 			)
 		)
-		(property "Footprint" "Seeed Studio XIAO Series Library:XIAO-ESP32-C3-SMD"
+		(property "Footprint" "wombat:XIAO-ESP32-C3-DIP-SMD"
 			(at 454.66 107.95 0)
-			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
